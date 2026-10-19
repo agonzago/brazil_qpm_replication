@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this code or the paper, please cite the paper."
+title: "From Calibration to Estimation: A Modern Bayesian Framework for Quarterly Projection Models"
+authors:
+  - family-names: "Gonzalez Gomez"
+    given-names: "Andres"
+  - family-names: "Prada"
+    given-names: "Juan David"
+year: 2026
+version: "6.0"
+doi: "TODO"
+url: "https://github.com/agonzago/gpm_ideas"
+keywords:
+  - Bayesian estimation
+  - quarterly projection model
+  - Hamiltonian Monte Carlo
+  - semi-structural models
+  - monetary policy
+  - Brazil

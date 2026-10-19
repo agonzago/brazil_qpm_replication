@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Generated estimation outputs
+brazil_wp/python/results*/
+brazil_wp/python/monthly_cache/
+brazil_wp/paper/plots/stylized_facts/
+*.log
+
+# OS
+.DS_Store

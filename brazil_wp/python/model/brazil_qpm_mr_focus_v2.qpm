@@ -1,0 +1,627 @@
+/*
+ * Brazil Open-Economy QPM -- Gap Model with Mean-Reverting Trends
+ *
+ * Extension of brazil_qpm.dyn.  Rate/flow trend variables now follow
+ * error-correction dynamics that pull them toward long-run steady-state
+ * values.  Level variables (LGDP_BAR, LZ_BAR, TT_BAR) remain
+ * random walks with drift.
+ *
+ * Trend equation form (for rate variables):
+ *     X_t = (1 - alpha_x) * X_{t-1} + alpha_x * x_ss + SHK_X_t
+ *
+ * Setting alpha_x = 0 recovers the original pure random walk, so the
+ * random-walk model is nested as a special case.
+ *
+ * The intercept c_x = alpha_x * x_ss is extracted by the parser and
+ * handled by the KalmanFilter's state intercept support (c parameter).
+ *
+ * Stationary block: 25 variables (+aux), 14 shocks  [RR_GAP_US added, v2]
+ * Trend block: 10 state variables, 3 contemporaneous defs, 10 shocks
+ * Observables: 14                                    [unchanged]
+ *
+ * New parameters:
+ *   alpha_g, alpha_dlz, alpha_prem, alpha_rr, alpha_pi,
+ *   alpha_rr_us, alpha_pi_us        -- convergence speeds (0 = random walk)
+ *   g_ss, d_lz_ss, prem_ss, rr_ss, pi_tar_ss,
+ *   rr_us_ss, pi_us_ss              -- long-run steady-state values
+ *
+ * Units convention:
+ *   - All inflation rates, policy rates, depreciation rates: annualized (pp)
+ *   - G_TREND, DLZ_TREND: quarterly (100*log per quarter)
+ *   - Levels (LGDP_BAR, LZ_BAR, TT_BAR): 100*log
+ */
+
+var
+    // Core domestic gaps
+    GDP_GAP              // Output gap (%)
+    DA_LCPIX             // Core CPI inflation gap (QoQ ann, pp from target)
+    DA_LCPI_ENERGY       // Energy CPI inflation gap (QoQ ann, pp from target)
+    DA_LCPI_FOOD         // Food CPI inflation gap (QoQ ann, pp from target)
+    DA_LCPI              // Headline CPI inflation gap (QoQ ann, pp from target)
+    RS                   // Nominal policy rate gap (pp from neutral)
+    RR_GAP               // Real interest rate gap (pp)
+    RR_GAP_US            // US real interest rate gap (pp)  [v2]
+    DA_LS                // Nominal exchange rate depreciation gap (QoQ ann, pp)
+    LZ_GAP               // Real exchange rate gap (100*log deviation from trend)
+    PREM_GAP             // Country risk premium gap (pp ann)
+    // Koyck-filtered transmission channels
+    QZ                   // Filtered REER depreciation for core PC pass-through
+    QRR                  // Filtered real interest rate gap for IS curve
+    QTT                  // Filtered ToT gap for IS curve
+    QZ_E                 // Filtered ER+oil driver for energy inflation
+    QZ_F                 // Filtered ER+food driver for food inflation
+    // Persistent shock states (AR(1))
+    RESN_GDP_GAP         // Persistent aggregate demand shock state
+    RESN_RS              // Persistent monetary policy shock state
+    // Foreign block (US)
+    GDP_GAP_US           // US output gap (%)
+    DA_LCPI_US           // US CPI inflation gap (QoQ ann, pp from target)
+    RS_US                // US nominal policy rate gap (pp from neutral)
+    // World commodity prices
+    LRWOIL_GAP           // World oil price gap (100*log deviation)
+    LRWFOOD_GAP          // World food price gap (100*log deviation)
+    // Terms of trade
+    TT_GAP               // Terms of trade gap (100*log deviation)
+    // Reporting / Taylor rule
+    D4A_LCPIX            // Year-on-year core inflation gap (4Q average)
+;
+
+varexo
+    SHK_GDP_GAP          // Aggregate demand shock
+    SHK_DA_LCPIX         // Core inflation shock
+    SHK_DA_LCPI_ENERGY   // Energy inflation shock
+    SHK_DA_LCPI_FOOD     // Food inflation shock
+    SHK_DA_LCPI          // Headline inflation shock
+    SHK_RS               // Monetary policy shock
+    SHK_LZ_GAP           // Real exchange rate (UIP) shock  [v2]
+    SHK_PREM_GAP         // Risk premium gap shock
+    SHK_GAP_US           // US demand shock
+    SHK_DA_LCPI_US       // US inflation shock
+    SHK_RS_US            // US monetary policy shock
+    SHK_LRWOIL_GAP       // World oil price shock
+    SHK_LRWFOOD_GAP      // World food price shock
+    SHK_TT_GAP           // Terms of trade gap shock
+;
+
+parameters
+    // IS Curve
+    beta1, beta2, beta3, beta4, beta5, phi_tt_is,
+    // Phillips Curve (Core)
+    lambda1x, lambda2x, kappa_z, lambda4x, lambda5x, lambda6x, phi_tt_pc,
+    // Headline Inflation Weights
+    lambda1s, lambda2s,
+    // Component Inflations
+    lambda_E1, theta_E,
+    lambda_F1, theta_F,
+    // Taylor Rule
+    gamma1, gamma2, gamma4,
+    // UIP / Exchange Rate
+    rho_ls, psi_uip,
+    // Premium
+    rho_prem_gap, phi_tt_gap,
+    // Koyck Filter Smoothing
+    rho_QZ, rho_QRR, rho_QTT, rho_QZ_E, rho_QZ_F,
+    // Persistence
+    rho_tt, rho_lrwoil_gap, rho_lrwfood_gap, rho_resn_gdp_gap, rho_res_rs,
+    // US Block
+    rho_US, beta1_US, beta2_US, beta3_us, rho_pie_us, gamma2_us, gamma4_us,
+
+    // ----- NEW: trend convergence speeds -----
+    alpha_g,         // Potential growth -> g_ss
+    alpha_dlz,       // REER trend depreciation -> d_lz_ss
+    alpha_prem,      // Risk premium trend -> prem_ss
+    alpha_rr,        // Equilibrium real rate -> rr_ss
+    alpha_pi,        // Inflation trend -> pi_tar_ss (target credibility)
+    alpha_rr_us,     // US neutral rate -> rr_us_ss
+    alpha_pi_us,     // US inflation trend -> pi_us_ss
+
+    // ----- NEW: long-run steady-state values -----
+    g_ss,            // Long-run quarterly potential growth (100*log per Q)
+    d_lz_ss,         // Long-run quarterly REER depreciation (100*log per Q)
+    prem_ss,         // Long-run risk premium (ann pp)
+    rr_ss,           // Long-run domestic equilibrium real rate (ann pp)
+    pi_tar_ss,       // Long-run inflation target (ann pp)
+    rr_us_ss,        // Long-run US neutral real rate (ann pp)
+    pi_us_ss         // Long-run US inflation target (ann pp)
+;
+
+// =====================================================================
+// PARAMETER VALUES (baseline calibration from Brazil QPM)
+// =====================================================================
+
+// --- IS Curve ---
+beta1        = 0.68;       // Output gap persistence
+beta2        = 0.10;       // Forward-looking output gap
+beta3        = 0.16;       // Real interest rate gap effect (via QRR)
+beta4        = 0.20;       // REER gap effect
+beta5        = 0.0108;     // US output gap spillover
+phi_tt_is    = 0.05;       // ToT gap demand channel
+
+// --- Phillips Curve (Core) ---
+lambda1x     = 0.60;       // Forward-looking weight
+lambda2x     = 0.16;       // Output gap slope
+kappa_z      = 0.025;      // Filtered REER pass-through (main ER channel)
+lambda4x     = 0.00;       // REER gap level effect (zero)
+lambda5x     = 0.0040;     // Oil pass-through to core
+lambda6x     = 0.0080;     // Food pass-through to core
+phi_tt_pc    = 0.0;        // ToT gap in Phillips curve
+
+// --- Headline Inflation Weights (CPI basket shares) ---
+lambda1s     = 0.1581;     // Energy weight
+lambda2s     = 0.1142;     // Food weight
+
+// --- Energy Inflation ---
+lambda_E1    = 0.85;       // Persistence
+theta_E      = 0.03;       // Filtered ER pass-through
+
+// --- Food Inflation ---
+lambda_F1    = 0.65;       // Persistence
+theta_F      = 0.04;       // Filtered ER pass-through
+
+// --- Taylor Rule ---
+gamma1       = 0.75;       // Interest rate smoothing
+gamma2       = 1.50;       // Inflation gap response (Taylor principle)
+gamma4       = 0.2023;     // Output gap response
+
+// --- UIP / Exchange Rate ---
+rho_ls       = 0.35;       // FX partial adjustment speed
+psi_uip      = 1.00;       // UIP semi-elasticity
+
+// --- Premium ---
+rho_prem_gap = 0.60;       // Premium gap persistence
+phi_tt_gap   = 0.10;       // Premium gap sensitivity to ToT gap
+
+// --- Koyck Filter Smoothing ---
+rho_QZ       = 0.90;       // ER-to-core smoothing
+rho_QRR      = 0.85;       // Real-rate transmission smoothing
+rho_QTT      = 0.00;       // ToT transmission smoothing
+rho_QZ_E     = 0.88;       // ER-to-energy smoothing
+rho_QZ_F     = 0.88;       // ER-to-food smoothing
+
+// --- Persistence ---
+rho_tt           = 0.75;   // ToT gap
+rho_lrwoil_gap   = 0.757;  // World oil price gap
+rho_lrwfood_gap  = 0.754;  // World food price gap
+rho_resn_gdp_gap = 0.50;   // Persistent demand shock
+rho_res_rs       = 0.50;   // Persistent MP shock
+
+// --- US Block ---
+rho_US       = 0.88;       // US Taylor smoothing
+beta1_US     = 0.5993;     // US IS: lag of output gap
+beta2_US     = 0.1439;     // US IS: real rate effect
+beta3_us     = 0.20;       // US PC: output gap slope
+rho_pie_us   = 0.45;       // US inflation persistence
+gamma2_us    = 1.50;       // US Taylor: inflation response
+gamma4_us    = 0.15;       // US Taylor: output gap response
+
+// --- NEW: Trend Convergence Speeds ---
+// alpha = 0 -> pure random walk (original model)
+// alpha = 1 -> immediate reversion to steady state
+// Typical range for quarterly models: 0.02 - 0.15
+alpha_g      = 0.10;       // ~7Q half-life for growth
+alpha_dlz    = 0.10;       // ~7Q half-life for REER depreciation
+alpha_prem   = 0.10;       // ~7Q half-life for risk premium
+alpha_rr     = 0.07;       // ~10Q half-life for domestic neutral rate
+alpha_pi     = 0.15;       // ~4.5Q half-life (target credibility)
+alpha_rr_us  = 0.07;       // ~10Q half-life for US neutral rate
+alpha_pi_us  = 0.07;       // ~10Q half-life (well-anchored Fed target)
+
+// --- Long-Run Steady-State Values ---
+g_ss         = 0.50;       // 2.0% annualized potential growth  (quarterly: 0.50)
+d_lz_ss      = 0.50;       // 2.0% annualized REER trend depreciation  (quarterly: 0.50)
+prem_ss      = 2.00;       // Risk premium (ann pp)
+rr_ss        = 4.50;       // Brazil equilibrium real rate (ann pp)  [= prem + rr_us + d_lz = 2.0 + 0.5 + 2.0]
+pi_tar_ss    = 3.00;       // BCB long-run inflation target (ann pp)
+rr_us_ss     = 0.50;       // US neutral real rate (ann pp)
+pi_us_ss     = 2.00;       // Fed long-run inflation target (ann pp)
+
+
+model;
+
+    // =================================================================
+    // 1. AGGREGATE DEMAND (IS Curve)
+    // =================================================================
+
+    // IS curve with gradual real-rate and ToT transmission
+    GDP_GAP = beta1*GDP_GAP(-1) + beta2*GDP_GAP(+1)
+              - beta3*QRR
+              + beta4*LZ_GAP
+              + beta5*GDP_GAP_US
+              + phi_tt_is*QTT
+              + RESN_GDP_GAP;
+
+    // Filtered real rate gap (Koyck lag)
+    QRR = rho_QRR*QRR(-1) + (1 - rho_QRR)*RR_GAP;
+
+    // Filtered ToT gap (Koyck lag)
+    QTT = rho_QTT*QTT(-1) + (1 - rho_QTT)*TT_GAP;
+
+    // Persistent demand shock state
+    RESN_GDP_GAP = rho_resn_gdp_gap*RESN_GDP_GAP(-1) + SHK_GDP_GAP;
+
+
+    // =================================================================
+    // 2. INFLATION BLOCK
+    // =================================================================
+
+    // Phillips curve -- core inflation
+    DA_LCPIX = lambda1x*DA_LCPIX(+1) + (1 - lambda1x)*DA_LCPIX(-1)
+               + lambda2x*GDP_GAP
+               + kappa_z*QZ
+               + lambda4x*LZ_GAP
+               + lambda5x*(LRWOIL_GAP + LZ_GAP)
+               + lambda6x*(LRWFOOD_GAP + LZ_GAP)
+               + phi_tt_pc*TT_GAP
+               + SHK_DA_LCPIX;
+
+    // Filtered REER depreciation gap for core PC (Koyck)
+    // Note: DA_LZ_GAP = DA_LS + DA_LCPI_US - DA_LCPI (substituted out)
+    QZ = rho_QZ*QZ(-1) + (1 - rho_QZ)*4*(LZ_GAP - LZ_GAP(-1));
+
+    // Filtered ER+oil driver for energy prices
+    QZ_E = rho_QZ_E*QZ_E(-1)
+           + (1 - rho_QZ_E)*(DA_LS + 4*(LRWOIL_GAP - LRWOIL_GAP(-1)));
+
+    // Filtered ER+food driver for food prices
+    QZ_F = rho_QZ_F*QZ_F(-1)
+           + (1 - rho_QZ_F)*(DA_LS + 4*(LRWFOOD_GAP - LRWFOOD_GAP(-1)));
+
+    // Energy inflation
+    DA_LCPI_ENERGY = lambda_E1*DA_LCPI_ENERGY(-1)
+                     + (1 - lambda_E1)*DA_LCPIX
+                     + theta_E*QZ_E
+                     + SHK_DA_LCPI_ENERGY;
+
+    // Food inflation
+    DA_LCPI_FOOD = lambda_F1*DA_LCPI_FOOD(-1)
+                   + (1 - lambda_F1)*DA_LCPIX
+                   + theta_F*QZ_F
+                   + SHK_DA_LCPI_FOOD;
+
+    // Headline inflation -- CPI aggregation
+    DA_LCPI = (1 - lambda1s - lambda2s)*DA_LCPIX
+              + lambda1s*DA_LCPI_ENERGY
+              + lambda2s*DA_LCPI_FOOD
+              + SHK_DA_LCPI;
+
+
+    // =================================================================
+    // 3. MONETARY POLICY
+    // =================================================================
+
+    // Year-on-year core inflation (4Q average gap)
+    D4A_LCPIX = (DA_LCPIX + DA_LCPIX(-1) + DA_LCPIX(-2) + DA_LCPIX(-3))/4;
+
+    // Taylor rule (gap version)
+    // DA_LCPI(+1) acts as neutral-rate adjustment in gap space
+    // gamma2*D4A_LCPIX(+3) is the active response to year-ahead annual core inflation
+    RS = gamma1*RS(-1)
+         + (1 - gamma1)*(DA_LCPI(+1) + gamma2*D4A_LCPIX(+3) + gamma4*GDP_GAP)
+         + RESN_RS;
+
+    // Persistent MP shock state
+    RESN_RS = rho_res_rs*RESN_RS(-1) + SHK_RS;
+
+    // Fisher equation -- real rate gap
+    RR_GAP = RS - DA_LCPI(+1);
+
+    // Fisher equation -- US real rate gap  [v2]
+    RR_GAP_US = RS_US - DA_LCPI_US(+1);
+
+
+    // =================================================================
+    // 4. EXCHANGE RATE & EXTERNAL SECTOR
+    // =================================================================
+
+    // Real-level UIP (v2) -- LZ_GAP is the UIP target
+    // rho_ls: partial adjustment; psi_uip: UIP semi-elasticity
+    // Risk premium sign corrected: higher PREM_GAP -> depreciation (+)
+    LZ_GAP = rho_ls/(1 + rho_ls) * LZ_GAP(-1)
+           + 1/(1 + rho_ls) * LZ_GAP(+1)
+           - (1 - rho_ls)*psi_uip / (4*(1 + rho_ls))
+             * (RR_GAP - RR_GAP_US - PREM_GAP)
+           + SHK_LZ_GAP;
+
+    // Nominal depreciation gap -- backward-looking identity  [v2]
+    DA_LS = 4*(LZ_GAP - LZ_GAP(-1)) + DA_LCPI - DA_LCPI_US;
+
+    // Risk premium gap
+    PREM_GAP = rho_prem_gap*PREM_GAP(-1)
+               + (1 - rho_prem_gap)*(-phi_tt_gap*TT_GAP)
+               + SHK_PREM_GAP;
+
+
+    // =================================================================
+    // 5. TERMS OF TRADE
+    // =================================================================
+
+    TT_GAP = rho_tt*TT_GAP(-1) + SHK_TT_GAP;
+
+
+    // =================================================================
+    // 6. FOREIGN BLOCK (US)
+    // =================================================================
+
+    // US IS curve
+    // Real rate gap at t-1: RS_US(t-1) - DA_LCPI_US(t) (Fisher at t-1)
+    GDP_GAP_US = beta1_US*GDP_GAP_US(-1)
+                 - beta2_US*(RS_US(-1) - DA_LCPI_US)
+                 + SHK_GAP_US;
+
+    // US Phillips curve
+    DA_LCPI_US = rho_pie_us*DA_LCPI_US(-1)
+                 + (1 - rho_pie_us)*beta3_us*GDP_GAP_US(-1)
+                 + SHK_DA_LCPI_US;
+
+    // US Taylor rule (gap version)
+    RS_US = rho_US*RS_US(-1)
+            + (1 - rho_US)*(DA_LCPI_US
+                             + gamma2_us*DA_LCPI_US(-1)
+                             + gamma4_us*GDP_GAP_US(-1))
+            + SHK_RS_US;
+
+
+    // =================================================================
+    // 7. WORLD COMMODITY PRICES
+    // =================================================================
+
+    LRWOIL_GAP  = rho_lrwoil_gap*LRWOIL_GAP(-1)  + SHK_LRWOIL_GAP;
+    LRWFOOD_GAP = rho_lrwfood_gap*LRWFOOD_GAP(-1) + SHK_LRWFOOD_GAP;
+
+end;
+
+
+// =====================================================================
+// TREND BLOCK  -  Mean-Reverting Trends
+// =====================================================================
+//
+// Rate/flow trends: X_t = (1 - alpha) X_{t-1} + alpha * x_ss + SHK
+// Level trends:     X_t = X_{t-1} + drift(-1) + SHK  (random walk with drift)
+//
+// alpha = 0 recovers the pure random walk (original brazil_qpm.dyn).
+// The intercept c = alpha * x_ss is extracted automatically by the parser.
+//
+// Half-lives (quarters): t_{1/2} = log(2) / log(1/(1-alpha))
+//   alpha = 0.03  ->  t_{1/2} ~ 23Q  (~6 years)
+//   alpha = 0.05  ->  t_{1/2} ~ 14Q  (~3.5 years)
+//   alpha = 0.10  ->  t_{1/2} ~ 7Q   (~1.75 years)
+//   alpha = 0.15  ->  t_{1/2} ~ 4Q   (~1 year)
+// =====================================================================
+
+varexo_trends
+    SHK_LGDP_BAR,
+    SHK_G_TREND,
+    SHK_LZ_BAR,
+    SHK_DLZ_TREND,
+    SHK_PREM_BAR,
+    SHK_RR_BAR,
+    SHK_PI_TREND,
+    SHK_RR_BAR_US,
+    SHK_TT_BAR,
+    SHK_PI_TREND_US
+;
+
+trends_vars
+    LGDP_BAR,
+    G_TREND,
+    LZ_BAR,
+    DLZ_TREND,
+    PREM_BAR,
+    RR_BAR,
+    PI_TREND,
+    RR_BAR_US,
+    TT_BAR,
+    PI_TREND_US,
+    // Contemporaneous definitions (derived, not state variables)
+    RS_TREND,
+    RS_US_TREND,
+    DA_LS_TREND
+;
+
+trend_model;
+    // -----------------------------------------------------------------
+    // Level trends (random walk with drift  -  NO mean reversion)
+    // -----------------------------------------------------------------
+
+    // GDP potential: level accumulates quarterly growth
+    LGDP_BAR = LGDP_BAR(-1) + G_TREND(-1) + SHK_LGDP_BAR;
+
+    // REER trend: level accumulates quarterly depreciation
+    LZ_BAR = LZ_BAR(-1) + DLZ_TREND(-1) + SHK_LZ_BAR;
+
+    // Terms of trade trend level (no natural long-run anchor)
+    TT_BAR = TT_BAR(-1) + SHK_TT_BAR;
+
+    // -----------------------------------------------------------------
+    // Rate/flow trends (mean-reverting to steady state)
+    // -----------------------------------------------------------------
+
+    // Potential growth rate (quarterly, 100*log per Q)
+    // Half-life at alpha_g=0.05: ~14 quarters
+    G_TREND = (1 - alpha_g)*G_TREND(-1) + alpha_g*g_ss + SHK_G_TREND;
+
+    // REER trend depreciation rate (quarterly, 100*log per Q)
+    DLZ_TREND = (1 - alpha_dlz)*DLZ_TREND(-1) + alpha_dlz*d_lz_ss + SHK_DLZ_TREND;
+
+    // Risk premium trend (annualized, pp)
+    PREM_BAR = (1 - alpha_prem)*PREM_BAR(-1) + alpha_prem*prem_ss + SHK_PREM_BAR;
+
+    // Domestic neutral real rate: error-correction to partial UIP equilibrium
+    // The attractor uses time-varying RR_BAR_US and PREM_BAR (both well-
+    // identified from observables) but pins the REER depreciation component
+    // at its steady-state value d_lz_ss.  This avoids contaminating the
+    // neutral rate with the high-frequency noise in DLZ_TREND, which
+    // otherwise drives alpha_rr toward zero and collapses the UIP link.
+    // At steady state: attractor = rr_us_ss + prem_ss + 4*d_lz_ss = 0.5 + 2.0 + 2.0 = 4.5.
+    RR_BAR = (1 - alpha_rr)*RR_BAR(-1) + alpha_rr*(RR_BAR_US(-1) + PREM_BAR(-1) + 4*d_lz_ss) + SHK_RR_BAR;
+
+    // Domestic inflation trend / target (annualized, pp)
+    // The convergence speed alpha_pi captures central bank credibility:
+    // faster convergence = more anchored expectations = higher credibility
+    PI_TREND = (1 - alpha_pi)*PI_TREND(-1) + alpha_pi*pi_tar_ss + SHK_PI_TREND;
+
+    // US equilibrium real rate (annualized, pp)
+    RR_BAR_US = (1 - alpha_rr_us)*RR_BAR_US(-1) + alpha_rr_us*rr_us_ss + SHK_RR_BAR_US;
+
+    // US inflation trend / target (annualized, pp)
+    PI_TREND_US = (1 - alpha_pi_us)*PI_TREND_US(-1) + alpha_pi_us*pi_us_ss + SHK_PI_TREND_US;
+
+    // -----------------------------------------------------------------
+    // Contemporaneous definitions (used in measurement equations)
+    // -----------------------------------------------------------------
+    // Neutral nominal rates: Fisher identity at trend level
+    RS_TREND    = RR_BAR + PI_TREND;
+    RS_US_TREND = RR_BAR_US + PI_TREND_US;
+    // Trend nominal depreciation (annualized): 4*quarterly_REER + inflation differential
+    DA_LS_TREND = 4*DLZ_TREND + PI_TREND - PI_TREND_US;
+end;
+
+
+// =====================================================================
+// OBSERVABLES & MEASUREMENT EQUATIONS  [unchanged from brazil_qpm.dyn]
+// =====================================================================
+
+varobs
+    OBS_LGDP
+    OBS_DA_LCPI
+    OBS_DA_LCPIX
+    OBS_DA_LCPI_ENERGY
+    OBS_DA_LCPI_US
+    OBS_DA_LS
+    OBS_LRWOIL_GAP
+    OBS_LRWFOOD_GAP
+    OBS_GDP_GAP_US
+    OBS_PREM
+    OBS_RS
+    OBS_RS_US
+    OBS_TT
+    OBS_DA_LCPI_TAR
+    OBS_RR_BAR_US
+    OBS_FOCUS_IPCA
+;
+
+measurement_equations;
+    // Level observable: GDP in 100*log
+    OBS_LGDP           = GDP_GAP + LGDP_BAR;
+    // Inflation rates: gap + inflation trend (annualized)
+    OBS_DA_LCPI        = DA_LCPI + PI_TREND;
+    OBS_DA_LCPIX       = DA_LCPIX + PI_TREND;
+    OBS_DA_LCPI_ENERGY = DA_LCPI_ENERGY + PI_TREND;
+    OBS_DA_LCPI_US     = DA_LCPI_US + PI_TREND_US;
+    // Nominal depreciation: gap + trend (annualized)
+    OBS_DA_LS          = DA_LS + DA_LS_TREND;
+    // Pure gap observables (no trend; data should be demeaned)
+    OBS_LRWOIL_GAP     = LRWOIL_GAP;
+    OBS_LRWFOOD_GAP    = LRWFOOD_GAP;
+    OBS_GDP_GAP_US     = GDP_GAP_US;
+    // Premium: gap + trend (annualized)
+    OBS_PREM           = PREM_GAP + PREM_BAR;
+    // Policy rates: gap + trend neutral rate (annualized)
+    OBS_RS             = RS + RS_TREND;
+    OBS_RS_US          = RS_US + RS_US_TREND;
+    // Terms of trade level (100*log)
+    OBS_TT             = TT_GAP + TT_BAR;
+    // Inflation target: direct observation of inflation trend
+    OBS_DA_LCPI_TAR    = PI_TREND;
+    // US neutral real rate: Laubach-Williams-Holston estimate (annualized, pp)
+    OBS_RR_BAR_US      = RR_BAR_US;
+    // Focus 12M IPCA expectations: second measure of inflation trend
+    OBS_FOCUS_IPCA     = PI_TREND;
+end;
+
+
+initval;
+    GDP_GAP = 0;
+    DA_LCPIX = 0;
+    DA_LCPI_ENERGY = 0;
+    DA_LCPI_FOOD = 0;
+    DA_LCPI = 0;
+    RS = 0;
+    RR_GAP = 0;
+    RR_GAP_US = 0;
+    DA_LS = 0;
+    LZ_GAP = 0;
+    PREM_GAP = 0;
+    QZ = 0;
+    QRR = 0;
+    QTT = 0;
+    QZ_E = 0;
+    QZ_F = 0;
+    RESN_GDP_GAP = 0;
+    RESN_RS = 0;
+    GDP_GAP_US = 0;
+    DA_LCPI_US = 0;
+    RS_US = 0;
+    LRWOIL_GAP = 0;
+    LRWFOOD_GAP = 0;
+    TT_GAP = 0;
+    D4A_LCPIX = 0;
+end;
+
+steady;
+check;
+
+
+// =====================================================================
+// SHOCK STANDARD DEVIATIONS (initial values, to be calibrated)
+// =====================================================================
+
+trend_shocks;
+    var SHK_LGDP_BAR;    stderr 0.5;
+    var SHK_G_TREND;     stderr 0.1;
+    var SHK_LZ_BAR;      stderr 0.5;
+    var SHK_DLZ_TREND;   stderr 0.1;
+    var SHK_PREM_BAR;    stderr 0.2;
+    var SHK_RR_BAR;      stderr 0.1;
+    var SHK_PI_TREND;    stderr 0.1;
+    var SHK_RR_BAR_US;   stderr 0.1;
+    var SHK_TT_BAR;      stderr 0.5;
+    var SHK_PI_TREND_US; stderr 0.1;
+end;
+
+shocks;
+    var SHK_GDP_GAP;         stderr 0.5;
+    var SHK_DA_LCPIX;        stderr 1.0;
+    var SHK_DA_LCPI_ENERGY;  stderr 2.0;
+    var SHK_DA_LCPI_FOOD;    stderr 2.0;
+    var SHK_DA_LCPI;         stderr 0.5;
+    var SHK_RS;              stderr 0.5;
+    var SHK_LZ_GAP;          stderr 5.0;
+    var SHK_PREM_GAP;        stderr 0.5;
+    var SHK_GAP_US;          stderr 0.5;
+    var SHK_DA_LCPI_US;      stderr 0.5;
+    var SHK_RS_US;           stderr 0.5;
+    var SHK_LRWOIL_GAP;      stderr 10.0;
+    var SHK_LRWFOOD_GAP;     stderr 10.0;
+    var SHK_TT_GAP;          stderr 5.0;
+end;
+
+stoch_simul(order=1, irf=40);
+
+reporting_equations;
+    // GDP growth rate: first difference of the output gap plus trend growth.
+    // DA_LGDP(t) = [GDP_GAP(t) - GDP_GAP(t-1)] + [LGDP_BAR(t) - LGDP_BAR(t-1)]
+    // This identity holds exactly since OBS_LGDP = GDP_GAP + LGDP_BAR.
+    DA_LGDP = GDP_GAP - GDP_GAP(-1) + LGDP_BAR - LGDP_BAR(-1);
+    // Annualised GDP growth rate (x4), matching the BVAR convention.
+    DA_LGDP_ANN = 4*(GDP_GAP - GDP_GAP(-1) + LGDP_BAR - LGDP_BAR(-1));
+
+    // -----------------------------------------------------------------
+    // Taylor rule components (for OBS_RS decomposition graph)
+    // -----------------------------------------------------------------
+    // OBS_RS = RS + RS_TREND, where RS_TREND = RR_BAR + PI_TREND (Fisher).
+    // The Taylor rule in gap form:
+    //   RS = gamma1*RS(-1) + (1-gamma1)*(DA_LCPI(+1) + gamma2*D4A_LCPIX(+3)
+    //        + gamma4*GDP_GAP) + RESN_RS
+    //
+    // Leads must be materialised as reporting variables for the smoother.
+    // The remaining components (RR_BAR, PI_TREND, GDP_GAP, RESN_RS, RS)
+    // are already state / trend variables.
+
+    // 1Q-ahead expected headline inflation (gap space)
+    EDA_LCPI1 = DA_LCPI(+1);
+    // Year-ahead annual core inflation expectation (gap space)
+    ED4A_LCPIX3 = D4A_LCPIX(+3);
+    // Observable-space expected headline inflation (for plotting)
+    EDA_LCPI1_OBS = DA_LCPI(+1) + PI_TREND;
+end;
